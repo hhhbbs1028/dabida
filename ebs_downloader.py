@@ -6,7 +6,9 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-DEFAULT_LIST_URL = "https://www.ebsi.co.kr/ebs/xip/xipc/previousPaperList.ebs"
+# ✅ 목록은 '전체 페이지(.ebs)'가 아니라 Ajax 전용 엔드포인트(.ajax)에서 내려옴
+DEFAULT_LIST_URL = "https://www.ebsi.co.kr/ebs/xip/xipc/previousPaperListAjax.ajax"
+# ✅ goDownLoadP/H 첫 인자(imgUrl)에 앞에 붙일 베이스(상대경로 → 절대경로)
 DEFAULT_BASE = "https://wdown.ebsi.co.kr/W61001/01exam"
 
 def sanitize_filename(name: str) -> str:
@@ -38,30 +40,72 @@ def ext_from_url(u: str | None, default: str = ".pdf") -> str:
     return f".{m.group(1)}" if m else default
 
 def parse_list_items(html: str):
-    """<li> 블록에서 제목(.tit), 문제(goDownLoadP), 해설(goDownLoadH) 추출"""
-    soup = BeautifulSoup(html, "lxml")
+    """Ajax로 받은 리스트 조각에서 <li> 카드별 제목/문제/해설 추출"""
+    # 파서 폴백
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
+    # 스크립트/스타일 제거 (JS 함수 정의로 인한 오탐 방지)
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+
     items = []
-    for li in soup.find_all("li"):
-        title_tag = li.select_one(".txt_wrap .txt_group .tit")
-        if not title_tag:
+
+    # 리스트 컨테이너가 보통 여기로 들어옴
+    container = soup.select_one("div.board_qusesion") or soup
+
+    # 문제 버튼을 기준으로 상위 li를 타고 올라가 제목과 함께 수집
+    problem_btns = container.select('li button[onclick^="goDownLoadP("]')
+
+    for pbtn in problem_btns:
+        li = pbtn.find_parent("li")
+        if not li:
             continue
-        title = sanitize_filename(title_tag.get_text(separator=" ", strip=True))
 
-        problem_btn = li.find("button", attrs={"onclick": re.compile(r"goDownLoadP\(")})
-        solution_btn = li.find("button", attrs={"onclick": re.compile(r"goDownLoadH\(")})
+        # 제목
+        title_tag = li.select_one(".tit") or li.find("p", class_="tit")
+        if title_tag:
+            title = sanitize_filename(title_tag.get_text(separator=" ", strip=True))
+        else:
+            raw = li.get_text(separator=" ", strip=True)
+            title = sanitize_filename(raw.split("  ")[0] if raw else "제목미상")
 
-        def first_arg(btn):
-            if not btn:
-                return None
-            on = btn.get("onclick", "")
-            m = re.search(r"\(\s*(['\"])(.+?)\1\s*,", on)
-            return m.group(2) if m else None
+        # 문제 URL (onclick 첫 번째 인자)
+        on_p = pbtn.get("onclick", "")
+        m_p = re.search(r"\(\s*(['\"])(.+?)\1\s*,", on_p)
+        prob_path = m_p.group(2) if m_p else None
 
-        prob_path = first_arg(problem_btn)
-        sol_path = first_arg(solution_btn)
+        # 같은 li의 해설 버튼
+        hbtn = li.select_one('button[onclick^="goDownLoadH("]')
+        sol_path = None
+        if hbtn:
+            on_h = hbtn.get("onclick", "")
+            m_h = re.search(r"\(\s*(['\"])(.+?)\1\s*,", on_h)
+            sol_path = m_h.group(2) if m_h else None
 
         if prob_path or sol_path:
             items.append((title, prob_path, sol_path))
+
+    # 보강: 혹시 goDownLoadP가 없고 goDownLoadH만 있는 예외 케이스
+    if not items:
+        for li in container.select("li"):
+            title_tag = li.select_one(".tit") or li.find("p", class_="tit")
+            if not title_tag:
+                continue
+            title = sanitize_filename(title_tag.get_text(separator=" ", strip=True))
+            pbtn = li.select_one('button[onclick^="goDownLoadP("]')
+            hbtn = li.select_one('button[onclick^="goDownLoadH("]')
+            def first_arg(btn):
+                if not btn: return None
+                m = re.search(r"\(\s*(['\"])(.+?)\1\s*,", btn.get("onclick",""))
+                return m.group(2) if m else None
+            prob_path = first_arg(pbtn)
+            sol_path  = first_arg(hbtn)
+            if prob_path or sol_path:
+                items.append((title, prob_path, sol_path))
+
     return items
 
 def download_file(session: requests.Session, url: str, out_path: Path, chunk=1024*64):
@@ -79,7 +123,7 @@ def download_file(session: requests.Session, url: str, out_path: Path, chunk=102
                         pbar.update(len(part))
 
 def add_cookies_from_header(cookie_header: str, session: requests.Session):
-    """Cookie: a=1; b=2; _fcOM={"k":"..."} 같은 한 줄 문자열을 세션 쿠키로 주입"""
+    """Request Headers의 Cookie 한 줄을 세션에 주입"""
     if not cookie_header:
         return
     for piece in [p.strip() for p in cookie_header.split(";") if p.strip()]:
@@ -87,42 +131,48 @@ def add_cookies_from_header(cookie_header: str, session: requests.Session):
             continue
         k, v = piece.split("=", 1)
         k = k.strip(); v = v.strip()
-        # 감싸진 따옴표 제거
         if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
             v = v[1:-1]
         session.cookies.set(k, v)
 
 def main():
-    ap = argparse.ArgumentParser(description="EBS POST(payload) 기반 문제/해설 자동 다운로드")
-    ap.add_argument("--list-url", default=DEFAULT_LIST_URL, help="목록 페이지 URL")
+    ap = argparse.ArgumentParser(description="EBS Ajax(payload) 기반 문제/해설 자동 다운로드")
+    ap.add_argument("--list-url", default=DEFAULT_LIST_URL, help="Ajax 목록 URL (.ajax)")
     ap.add_argument("--base", default=DEFAULT_BASE, help="상대경로 앞에 붙일 다운로드 서버 베이스 URL")
     ap.add_argument("--out", default="downloads", help="다운로드 루트 폴더")
+    ap.add_argument("--debug", action="store_true", help="응답/파싱 디버그 출력")
 
-    # 네가 캡처한 Form Data와 동일 형태로 받도록 설계
-    ap.add_argument("--targetCd", default="D300", help="시험 코드 (기본: D300)")
+    # Form Data (DevTools에서 XHR의 Form Data와 동일형태로 맞추세요)
+    ap.add_argument("--targetCd", default="D300", help="시험 코드 (예: 고3·N수=D300)")
     ap.add_argument("--beginYear", type=int, required=True)
     ap.add_argument("--endYear", type=int, required=True)
-    ap.add_argument("--monthAll", default="on", choices=["on", "off"], help='"on" 또는 "off"(기본 on)')
+    ap.add_argument("--monthAll", default="on", choices=["on", "off"], help='"on"/"off"')
     ap.add_argument("--monthList", default="03,02,04,05,06,07,09,10,11,12",
-                    help='콤마 문자열 (예: "03,02,04,05,06,07,09,10,11,12")')
+                    help='콤마 문자열 예: "03,02,04,05,06,07,09,10,11,12" (사이트가 보내면 그대로 넣기)')
     ap.add_argument("--month", default="03,04,06,07,09,10,11",
-                    help='응답에서 보인 배열 값과 맞추기 위해 콤마 문자열로 받고 내부에서 배열로 변환 (예: "03,04,06,07,09,10,11")')
-    ap.add_argument("--subjList", default="6", help='과목(영역) 리스트 코드 (과탐 전체= "6")')
-    ap.add_argument("--subj", default="6", help='과목(영역) 코드 (과탐 전체= "6")')
-    ap.add_argument("--sort", default="recent", help='정렬 (기본: recent)')
+                    help='실제 전송은 배열로 보냄. 편의상 콤마 문자열로 받고 내부에서 배열로 변환')
+    ap.add_argument("--subjList", default="6", help='과목(영역) 리스트 코드 (예: 과탐 전체="6")')
+    ap.add_argument("--subj", default="6", help='과목(영역) 코드 (예: 과탐 전체="6")')
+    ap.add_argument("--sort", default="recent", help='정렬 (예: recent)')
+    # Ajax에서 종종 쓰는 숨은 필드
+    ap.add_argument("--pageIndex", default="1")
+    ap.add_argument("--searchFlag", default="Y")
 
     # 쿠키
-    ap.add_argument("--cookie-file", default=None, help="Cookie 헤더 문자열 파일 경로(권장)")
+    ap.add_argument("--cookie-file", default=None, help="Cookie 헤더 문자열 파일 경로")
     ap.add_argument("--cookie", default=None, help="Cookie 헤더 문자열(한 줄)")
 
     args = ap.parse_args()
 
-    # 세션/헤더
+    # 세션/헤더 (XHR 성격을 명시)
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (compatible; EBS-Downloader/2.0)",
-        "Referer": args.list_url,
         "Origin": "https://www.ebsi.co.kr",
+        "Referer": "https://www.ebsi.co.kr/ebs/xip/xipc/previousPaperList.ebs?targetCd=D300",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "text/html, */*; q=0.01",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     })
 
     # 쿠키 주입
@@ -134,43 +184,57 @@ def main():
     if cookie_header:
         add_cookies_from_header(cookie_header, session)
 
-    # payload 구성 (네가 올린 Payload 형식 그대로)
+    # payload (사이트가 serialize하는 형식에 맞춤)
     payload = {
         "targetCd": args.targetCd,
         "beginYear": args.beginYear,
         "endYear": args.endYear,
-        "monthAll": args.monthAll,         # "on"/"off"
-        "monthList": args.monthList,       # 콤마 문자열
-        "subjList": args.subjList,         # 문자열 "6"
-        "subj": args.subj,                 # 문자열 "6"
+        "monthAll": args.monthAll,     # "on"/"off"
+        "monthList": args.monthList,   # 콤마 문자열
+        "subjList": args.subjList,     # 문자열
+        "subj": args.subj,             # 문자열
         "sort": args.sort,
+        "pageIndex": args.pageIndex,
+        "searchFlag": args.searchFlag,
     }
-    # month는 배열로 전송
+
+    # month는 배열 전송(= 같은 키로 여러 값). requests는 리스트값을 주면 됨 → 튜플로 구성
     month_arr = [m.strip() for m in args.month.split(",") if m.strip()]
-    for m in month_arr:
-        # 폼데이터 배열 전송: month=03&month=04&...
-        # requests는 리스트를 값으로 주면 알아서 배열 형태로 보냄 -> dict 대신 list of tuples 사용
-        pass
-    # 위를 위해 실제 전송 payload를 튜플 리스트로 빌드
     data = []
     for k, v in payload.items():
         data.append((k, v))
     for m in month_arr:
         data.append(("month", m))
 
-    # POST 요청
+    # POST (Ajax 전용 URL)
     r = session.post(args.list_url, data=data, timeout=60)
     r.raise_for_status()
     html = r.text
 
+    # 디버그 출력/저장
+    if args.debug:
+        print("DEBUG status:", r.status_code, "| content-type:", r.headers.get("content-type"))
+        print("DEBUG head 2000:\n", html[:2000])
+        Path("debug_response.html").write_text(html, encoding=r.encoding or "utf-8", errors="ignore")
+
     if "<li" not in html:
-        print("⚠️ 목록이 비어 있습니다. (쿠키 만료/권한/파라미터 불일치 가능)")
+        print("⚠️ 리스트가 비어 있거나 로그인/파라미터 문제가 있습니다. (debug_response.html 확인)")
         return
 
-    # 항목 파싱
+    # 파싱
     items = parse_list_items(html)
+    if args.debug:
+        # 간단한 카운터 로그
+        try:
+            soup_tmp = BeautifulSoup(html, "lxml")
+        except Exception:
+            soup_tmp = BeautifulSoup(html, "html.parser")
+        container_tmp = soup_tmp.select_one("div.board_qusesion") or soup_tmp
+        btns = container_tmp.select('li button[onclick^="goDownLoadP("]')
+        print("DEBUG: problem buttons found:", len(btns))
+
     if not items:
-        print("⚠️ 파싱된 항목이 없습니다. (필터 결과 없음 또는 HTML 구조 변경)")
+        print("⚠️ 파싱된 항목이 없습니다. (HTML 구조 변경 가능) → debug_response.html 열어 확인해 주세요.")
         return
 
     out_root = Path(args.out)
@@ -212,16 +276,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# (base) PS C:\Users\JH\coding\project\산학협력> python ebs_downloader.py `
-# >>   --list-url "https://www.ebsi.co.kr/ebs/xip/xipc/previousPaperList.ebs" `
-# >>   --base "https://wdown.ebsi.co.kr/W61001/01exam" `
-# >>   --beginYear 2020 --endYear 2024 `
-# >>   --monthAll on `
-# >>   --monthList "03,02,04,05,06,07,09,10,11,12" `
-# >>   --month "03,04,06,07,09,10,11" `
-# >>   --subjList 6 `
-# >>   --subj 6 `
-# >>   --sort recent `
-# >>   --cookie-file "C:\Users\JH\coding\project\산학협력\cookie.txt" `
-# >>   --out "C:\Users\JH\Downloads\ebs"
