@@ -6,24 +6,92 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-# ✅ 목록은 '전체 페이지(.ebs)'가 아니라 Ajax 전용 엔드포인트(.ajax)에서 내려옴
 DEFAULT_LIST_URL = "https://www.ebsi.co.kr/ebs/xip/xipc/previousPaperListAjax.ajax"
-# ✅ goDownLoadP/H 첫 인자(imgUrl)에 앞에 붙일 베이스(상대경로 → 절대경로)
 DEFAULT_BASE = "https://wdown.ebsi.co.kr/W61001/01exam"
 
+# 이번 payload 고정 값 (month(복수 키) 없이, 페이지네이션 사용)
+FIXED_PAYLOAD = {
+    "beginYear": "2020",
+    "endYear": "2024",
+    "targetCd": "D300",
+    "monthList": "03,02,04,05,06,07,09,10,11,12",
+    "subjList": "6",
+    "sort": "recent",
+    "pageSize": "15",
+}
+
+# ---------- 유틸 ----------
 def sanitize_filename(name: str) -> str:
-    name = re.sub(r'[\\/:*?"<>|]', ' ', name)
-    name = re.sub(r'\s+', ' ', name).strip()
+    # 파일명 금지문자 제거 + 공백 정리
+    name = re.sub(r'[\\/:*?"<>|]', " ", name)
+    name = re.sub(r'\s+', " ", name).strip()
     return name
 
 def extract_year(title: str) -> str:
     m = re.search(r'(\d{4})\s*년', title)
     return m.group(1) if m else "기타"
 
-def extract_subject(title: str) -> str:
+def extract_month(title: str) -> str:
+    """
+    제목에서 월 추출 (두 자리, 못 찾으면 '00')
+    - '10월', '3월' 패턴
+    - '12.3 시행' 같은 'M.D 시행' 패턴
+    - '12.3'처럼 점 표기(시행 근처)도 커버
+    """
+    # 1) '10월', '3월'
+    m = re.search(r'(\d{1,2})\s*월', title)
+    if m:
+        return f"{int(m.group(1)):02d}"
+    # 2) '12.3 시행' / '12.03 시행'
+    m = re.search(r'(\d{1,2})\.\s*\d{1,2}\s*시행', title)
+    if m:
+        return f"{int(m.group(1)):02d}"
+    # 3) '12.3' 근처에 '시행'이 없더라도 월로 보이는 경우(보수적)
+    m = re.search(r'(\d{1,2})\.\s*\d{1,2}', title)
+    if m:
+        return f"{int(m.group(1)):02d}"
+    return "00"
+
+def extract_subject_raw(title: str) -> str:
+    """제목 마지막 토큰을 과목 후보로 사용 (예: '물리학Ⅰ', '생명과학Ⅱ')"""
     t = title.replace("\xa0", " ")
     parts = t.strip().split()
     return parts[-1] if parts else "과목"
+
+def normalize_subject(subj: str) -> str:
+    """
+    과목 표기 정규화:
+      - 마지막 토큰(예: 물리학Ⅰ, 화학Ⅱ, 생명과학Ⅰ, 지구과학Ⅱ)을 표준화
+      - 로마 숫자 ⅠⅡⅢⅣ → 1/2/3/4
+      - '물리학' → '물리', '화학'은 그대로 '화학', '생명과학', '지구과학' 유지
+      - 최종 형태: 물리1, 화학2, 생명과학1, 지구과학2
+    """
+    s = (subj or "").replace(" ", "")
+    # 로마 숫자 → 숫자
+    roman_map = {"Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3", "Ⅳ": "4", "I": "1", "II": "2", "III": "3", "IV": "4"}
+    for k, v in roman_map.items():
+        s = s.replace(k, v)
+
+    # 숫자(레벨) 추출 (마지막 숫자 1~4)
+    m_level = re.search(r'([1-4])$', s)
+    level = m_level.group(1) if m_level else ""
+
+    # 베이스 과목명 판정
+    base = ""
+    if "생명과학" in s:
+        base = "생명과학"
+    elif "지구과학" in s:
+        base = "지구과학"
+    elif s.startswith("물리") or "물리학" in s:
+        base = "물리"
+    elif "화학" in s or s.startswith("화"):   # 과탐에서 '화'만 온 경우도 화학으로 간주
+        base = "화학"
+    else:
+        # 예외: 그대로 반환 (숫자 붙어 있으면 유지)
+        base = s
+
+    return f"{base}{level}" if level else base
+
 
 def build_abs_url(raw: str | None, base: str) -> str | None:
     if not raw:
@@ -40,23 +108,15 @@ def ext_from_url(u: str | None, default: str = ".pdf") -> str:
     return f".{m.group(1)}" if m else default
 
 def parse_list_items(html: str):
-    """Ajax로 받은 리스트 조각에서 <li> 카드별 제목/문제/해설 추출"""
-    # 파서 폴백
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
         soup = BeautifulSoup(html, "html.parser")
-
-    # 스크립트/스타일 제거 (JS 함수 정의로 인한 오탐 방지)
     for tag in soup(["script", "style"]):
         tag.decompose()
 
     items = []
-
-    # 리스트 컨테이너가 보통 여기로 들어옴
     container = soup.select_one("div.board_qusesion") or soup
-
-    # 문제 버튼을 기준으로 상위 li를 타고 올라가 제목과 함께 수집
     problem_btns = container.select('li button[onclick^="goDownLoadP("]')
 
     for pbtn in problem_btns:
@@ -64,7 +124,6 @@ def parse_list_items(html: str):
         if not li:
             continue
 
-        # 제목
         title_tag = li.select_one(".tit") or li.find("p", class_="tit")
         if title_tag:
             title = sanitize_filename(title_tag.get_text(separator=" ", strip=True))
@@ -72,12 +131,10 @@ def parse_list_items(html: str):
             raw = li.get_text(separator=" ", strip=True)
             title = sanitize_filename(raw.split("  ")[0] if raw else "제목미상")
 
-        # 문제 URL (onclick 첫 번째 인자)
         on_p = pbtn.get("onclick", "")
         m_p = re.search(r"\(\s*(['\"])(.+?)\1\s*,", on_p)
         prob_path = m_p.group(2) if m_p else None
 
-        # 같은 li의 해설 버튼
         hbtn = li.select_one('button[onclick^="goDownLoadH("]')
         sol_path = None
         if hbtn:
@@ -87,24 +144,6 @@ def parse_list_items(html: str):
 
         if prob_path or sol_path:
             items.append((title, prob_path, sol_path))
-
-    # 보강: 혹시 goDownLoadP가 없고 goDownLoadH만 있는 예외 케이스
-    if not items:
-        for li in container.select("li"):
-            title_tag = li.select_one(".tit") or li.find("p", class_="tit")
-            if not title_tag:
-                continue
-            title = sanitize_filename(title_tag.get_text(separator=" ", strip=True))
-            pbtn = li.select_one('button[onclick^="goDownLoadP("]')
-            hbtn = li.select_one('button[onclick^="goDownLoadH("]')
-            def first_arg(btn):
-                if not btn: return None
-                m = re.search(r"\(\s*(['\"])(.+?)\1\s*,", btn.get("onclick",""))
-                return m.group(2) if m else None
-            prob_path = first_arg(pbtn)
-            sol_path  = first_arg(hbtn)
-            if prob_path or sol_path:
-                items.append((title, prob_path, sol_path))
 
     return items
 
@@ -123,51 +162,28 @@ def download_file(session: requests.Session, url: str, out_path: Path, chunk=102
                         pbar.update(len(part))
 
 def add_cookies_from_header(cookie_header: str, session: requests.Session):
-    """Request Headers의 Cookie 한 줄을 세션에 주입"""
     if not cookie_header:
         return
     for piece in [p.strip() for p in cookie_header.split(";") if p.strip()]:
         if "=" not in piece:
             continue
         k, v = piece.split("=", 1)
-        k = k.strip(); v = v.strip()
-        if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
-            v = v[1:-1]
-        session.cookies.set(k, v)
+        session.cookies.set(k.strip(), v.strip().strip('"').strip("'"))
 
+# ---------- 메인 ----------
 def main():
-    ap = argparse.ArgumentParser(description="EBS Ajax(payload) 기반 문제/해설 자동 다운로드")
-    ap.add_argument("--list-url", default=DEFAULT_LIST_URL, help="Ajax 목록 URL (.ajax)")
-    ap.add_argument("--base", default=DEFAULT_BASE, help="상대경로 앞에 붙일 다운로드 서버 베이스 URL")
-    ap.add_argument("--out", default="downloads", help="다운로드 루트 폴더")
-    ap.add_argument("--debug", action="store_true", help="응답/파싱 디버그 출력")
-
-    # Form Data (DevTools에서 XHR의 Form Data와 동일형태로 맞추세요)
-    ap.add_argument("--targetCd", default="D300", help="시험 코드 (예: 고3·N수=D300)")
-    ap.add_argument("--beginYear", type=int, required=True)
-    ap.add_argument("--endYear", type=int, required=True)
-    ap.add_argument("--monthAll", default="on", choices=["on", "off"], help='"on"/"off"')
-    ap.add_argument("--monthList", default="03,02,04,05,06,07,09,10,11,12",
-                    help='콤마 문자열 예: "03,02,04,05,06,07,09,10,11,12" (사이트가 보내면 그대로 넣기)')
-    ap.add_argument("--month", default="03,04,06,07,09,10,11",
-                    help='실제 전송은 배열로 보냄. 편의상 콤마 문자열로 받고 내부에서 배열로 변환')
-    ap.add_argument("--subjList", default="6", help='과목(영역) 리스트 코드 (예: 과탐 전체="6")')
-    ap.add_argument("--subj", default="6", help='과목(영역) 코드 (예: 과탐 전체="6")')
-    ap.add_argument("--sort", default="recent", help='정렬 (예: recent)')
-    # Ajax에서 종종 쓰는 숨은 필드
-    ap.add_argument("--pageIndex", default="1")
-    ap.add_argument("--searchFlag", default="Y")
-
-    # 쿠키
-    ap.add_argument("--cookie-file", default=None, help="Cookie 헤더 문자열 파일 경로")
-    ap.add_argument("--cookie", default=None, help="Cookie 헤더 문자열(한 줄)")
-
+    ap = argparse.ArgumentParser(description="EBS Ajax 기반 페이지 순회 다운로드 (규칙형 이름 버전)")
+    ap.add_argument("--list-url", default=DEFAULT_LIST_URL)
+    ap.add_argument("--base", default=DEFAULT_BASE)
+    ap.add_argument("--out", default="downloads")
+    ap.add_argument("--cookie-file", default=None)
+    ap.add_argument("--cookie", default=None)
+    ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
-    # 세션/헤더 (XHR 성격을 명시)
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; EBS-Downloader/2.0)",
+        "User-Agent": "Mozilla/5.0 (compatible; EBS-Downloader/2.2)",
         "Origin": "https://www.ebsi.co.kr",
         "Referer": "https://www.ebsi.co.kr/ebs/xip/xipc/previousPaperList.ebs?targetCd=D300",
         "X-Requested-With": "XMLHttpRequest",
@@ -175,7 +191,6 @@ def main():
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     })
 
-    # 쿠키 주입
     cookie_header = None
     if args.cookie_file:
         cookie_header = Path(args.cookie_file).read_text(encoding="utf-8").strip()
@@ -184,95 +199,68 @@ def main():
     if cookie_header:
         add_cookies_from_header(cookie_header, session)
 
-    # payload (사이트가 serialize하는 형식에 맞춤)
-    payload = {
-        "targetCd": args.targetCd,
-        "beginYear": args.beginYear,
-        "endYear": args.endYear,
-        "monthAll": args.monthAll,     # "on"/"off"
-        "monthList": args.monthList,   # 콤마 문자열
-        "subjList": args.subjList,     # 문자열
-        "subj": args.subj,             # 문자열
-        "sort": args.sort,
-        "pageIndex": args.pageIndex,
-        "searchFlag": args.searchFlag,
-    }
-
-    # month는 배열 전송(= 같은 키로 여러 값). requests는 리스트값을 주면 됨 → 튜플로 구성
-    month_arr = [m.strip() for m in args.month.split(",") if m.strip()]
-    data = []
-    for k, v in payload.items():
-        data.append((k, v))
-    for m in month_arr:
-        data.append(("month", m))
-
-    # POST (Ajax 전용 URL)
-    r = session.post(args.list_url, data=data, timeout=60)
-    r.raise_for_status()
-    html = r.text
-
-    # 디버그 출력/저장
-    if args.debug:
-        print("DEBUG status:", r.status_code, "| content-type:", r.headers.get("content-type"))
-        print("DEBUG head 2000:\n", html[:2000])
-        Path("debug_response.html").write_text(html, encoding=r.encoding or "utf-8", errors="ignore")
-
-    if "<li" not in html:
-        print("⚠️ 리스트가 비어 있거나 로그인/파라미터 문제가 있습니다. (debug_response.html 확인)")
-        return
-
-    # 파싱
-    items = parse_list_items(html)
-    if args.debug:
-        # 간단한 카운터 로그
-        try:
-            soup_tmp = BeautifulSoup(html, "lxml")
-        except Exception:
-            soup_tmp = BeautifulSoup(html, "html.parser")
-        container_tmp = soup_tmp.select_one("div.board_qusesion") or soup_tmp
-        btns = container_tmp.select('li button[onclick^="goDownLoadP("]')
-        print("DEBUG: problem buttons found:", len(btns))
-
-    if not items:
-        print("⚠️ 파싱된 항목이 없습니다. (HTML 구조 변경 가능) → debug_response.html 열어 확인해 주세요.")
-        return
-
     out_root = Path(args.out)
 
-    # 다운로드
-    for title, prob_path, sol_path in items:
-        year = extract_year(title)
-        subject_name = sanitize_filename(extract_subject(title))
+    page = 1
+    while True:
+        data = list(FIXED_PAYLOAD.items()) + [("currentPage", str(page))]
+        r = session.post(args.list_url, data=data, timeout=60)
+        r.raise_for_status()
+        html = r.text
 
-        prob_url = build_abs_url(prob_path, args.base) if prob_path else None
-        sol_url = build_abs_url(sol_path, args.base) if sol_path else None
+        if args.debug:
+            Path(f"debug_page_{page}.html").write_text(html, encoding="utf-8", errors="ignore")
 
-        prob_ext = ext_from_url(prob_url, ".pdf")
-        sol_ext = ext_from_url(sol_url, ".pdf")
+        if "<li" not in html:
+            print(f"페이지 {page}: 더 이상 항목 없음 → 종료")
+            break
 
-        base_name = sanitize_filename(title)
-        prob_name = f"{base_name}{prob_ext}"
-        sol_name = f"{base_name}_해{sol_ext}"
+        items = parse_list_items(html)
+        if not items:
+            print(f"페이지 {page}: 항목 없음 → 종료")
+            break
 
-        target_dir = out_root / year / subject_name
+        print(f"페이지 {page}: {len(items)}건 다운로드")
 
-        try:
-            if prob_url:
-                download_file(session, prob_url, target_dir / prob_name)
-            else:
-                print(f"※ 문제 URL 없음: {title}")
+        for title, prob_path, sol_path in items:
+            year  = extract_year(title)
+            month = extract_month(title)          # 새로 추가
+            subj_raw = extract_subject_raw(title)
+            subj_norm = normalize_subject(subj_raw)
 
-            if sol_url:
-                download_file(session, sol_url, target_dir / sol_name)
-            else:
-                print(f"※ 해설 URL 없음: {title}")
+            prob_url = build_abs_url(prob_path, args.base) if prob_path else None
+            sol_url  = build_abs_url(sol_path,  args.base) if sol_path  else None
 
-        except requests.HTTPError as e:
-            print(f"HTTP 오류: {title} -> {e}")
-        except Exception as e:
-            print(f"다운로드 실패: {title} -> {e}")
+            prob_ext = ext_from_url(prob_url, ".pdf")
+            sol_ext  = ext_from_url(sol_url,  ".pdf")
 
-    print("✅ 완료")
+            # ---- 폴더명 규칙: downloads/기출문제_고3_과학탐구{과목}_{년도}
+            target_dir = out_root / f"기출문제_고3_과학탐구_{subj_norm}_{year}"
+
+            # ---- 파일명 규칙: YYYY_MM_과목_문제 / YYYY_MM_과목_해설
+            base_prefix = f"{year}_{month}_{subj_norm}"
+            prob_name = f"{base_prefix}_문제{prob_ext}"
+            sol_name  = f"{base_prefix}_해설{sol_ext}"
+
+            try:
+                if prob_url:
+                    download_file(session, prob_url, target_dir / prob_name)
+                else:
+                    print(f"※ 문제 URL 없음: {title}")
+
+                if sol_url:
+                    download_file(session, sol_url, target_dir / sol_name)
+                else:
+                    print(f"※ 해설 URL 없음: {title}")
+
+            except requests.HTTPError as e:
+                print(f"HTTP 오류: {title} -> {e}")
+            except Exception as e:
+                print(f"다운로드 실패: {title} -> {e}")
+
+        page += 1
+
+    print("✅ 전체 완료")
 
 if __name__ == "__main__":
     main()
