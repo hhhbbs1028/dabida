@@ -162,7 +162,7 @@ def main():
     ap.add_argument("--list-url", default=DEFAULT_LIST_URL)
     ap.add_argument("--base", default=DEFAULT_BASE)
     ap.add_argument("--out", default="downloads")
-    ap.add_argument("--cookie-file", default=None)
+    ap.add_argument("--cookie-file", default=str(Path(__file__).with_name("cookie.txt")))
     ap.add_argument("--cookie", default=None)
     ap.add_argument("--debug", action="store_true")
 
@@ -191,27 +191,31 @@ def main():
 
     args = ap.parse_args()
 
+    target_cd = TARGET_MAP[args.grade]
+
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (compatible; EBS-Downloader/2.2)",
         "Origin": "https://www.ebsi.co.kr",
-        "Referer": "https://www.ebsi.co.kr/ebs/xip/xipc/previousPaperList.ebs?targetCd=D300",
+        "Referer": "https://www.ebsi.co.kr/ebs/xip/xipc/previousPaperList.ebs?targetCd={target_cd}",
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "text/html, */*; q=0.01",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     })
 
     cookie_header = None
-    if args.cookie_file:
+    if args.cookie_file and Path(args.cookie_file).exists():
         cookie_header = Path(args.cookie_file).read_text(encoding="utf-8").strip()
     elif args.cookie:
         cookie_header = args.cookie.strip()
+
     if cookie_header:
         add_cookies_from_header(cookie_header, session)
+    else:
+        print("⚠️ cookie.txt 파일을 찾지 못했거나 비어 있음 → 로그인 필요한 자료는 다운로드 불가할 수 있습니다.")
 
     out_root = Path(args.out)
 
-    target_cd = TARGET_MAP[args.grade]
     grade_name = GRADE_NAME[args.grade]
 
     # ✅ payload를 동적으로 구성 (subjList를 인자로부터)
