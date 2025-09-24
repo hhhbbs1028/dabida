@@ -9,20 +9,28 @@ from tqdm import tqdm
 DEFAULT_LIST_URL = "https://www.ebsi.co.kr/ebs/xip/xipc/previousPaperListAjax.ajax"
 DEFAULT_BASE = "https://wdown.ebsi.co.kr/W61001/01exam"
 
-# 이번 payload 고정 값 (month(복수 키) 없이, 페이지네이션 사용)
-FIXED_PAYLOAD = {
-    "beginYear": "2020",
-    "endYear": "2024",
-    "targetCd": "D300",
-    "monthList": "03,02,04,05,06,07,09,10,11,12",
-    "subjList": "6",
-    "sort": "recent",
-    "pageSize": "15",
+# 카테고리 인덱스 → 카테고리명
+CATEGORY_MAP = {
+    1: "국어",
+    2: "수학",
+    3: "영어",
+    4: "한국사",
+    5: "사회탐구",
+    6: "과학탐구",
+    7: "직업탐구",
+    8: "제2외국어",
 }
+
+TARGET_MAP = {
+    1: "D100",
+    2: "D200",
+    3: "D300",
+}
+
+GRADE_NAME = {1: "고1", 2: "고2", 3: "고3"}
 
 # ---------- 유틸 ----------
 def sanitize_filename(name: str) -> str:
-    # 파일명 금지문자 제거 + 공백 정리
     name = re.sub(r'[\\/:*?"<>|]', " ", name)
     name = re.sub(r'\s+', " ", name).strip()
     return name
@@ -32,51 +40,31 @@ def extract_year(title: str) -> str:
     return m.group(1) if m else "기타"
 
 def extract_month(title: str) -> str:
-    """
-    제목에서 월 추출 (두 자리, 못 찾으면 '00')
-    - '10월', '3월' 패턴
-    - '12.3 시행' 같은 'M.D 시행' 패턴
-    - '12.3'처럼 점 표기(시행 근처)도 커버
-    """
-    # 1) '10월', '3월'
     m = re.search(r'(\d{1,2})\s*월', title)
     if m:
         return f"{int(m.group(1)):02d}"
-    # 2) '12.3 시행' / '12.03 시행'
     m = re.search(r'(\d{1,2})\.\s*\d{1,2}\s*시행', title)
     if m:
         return f"{int(m.group(1)):02d}"
-    # 3) '12.3' 근처에 '시행'이 없더라도 월로 보이는 경우(보수적)
     m = re.search(r'(\d{1,2})\.\s*\d{1,2}', title)
     if m:
         return f"{int(m.group(1)):02d}"
     return "00"
 
 def extract_subject_raw(title: str) -> str:
-    """제목 마지막 토큰을 과목 후보로 사용 (예: '물리학Ⅰ', '생명과학Ⅱ')"""
     t = title.replace("\xa0", " ")
     parts = t.strip().split()
     return parts[-1] if parts else "과목"
 
 def normalize_subject(subj: str) -> str:
-    """
-    과목 표기 정규화:
-      - 마지막 토큰(예: 물리학Ⅰ, 화학Ⅱ, 생명과학Ⅰ, 지구과학Ⅱ)을 표준화
-      - 로마 숫자 ⅠⅡⅢⅣ → 1/2/3/4
-      - '물리학' → '물리', '화학'은 그대로 '화학', '생명과학', '지구과학' 유지
-      - 최종 형태: 물리1, 화학2, 생명과학1, 지구과학2
-    """
     s = (subj or "").replace(" ", "")
-    # 로마 숫자 → 숫자
     roman_map = {"Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3", "Ⅳ": "4", "I": "1", "II": "2", "III": "3", "IV": "4"}
     for k, v in roman_map.items():
         s = s.replace(k, v)
 
-    # 숫자(레벨) 추출 (마지막 숫자 1~4)
     m_level = re.search(r'([1-4])$', s)
     level = m_level.group(1) if m_level else ""
 
-    # 베이스 과목명 판정
     base = ""
     if "생명과학" in s:
         base = "생명과학"
@@ -84,14 +72,12 @@ def normalize_subject(subj: str) -> str:
         base = "지구과학"
     elif s.startswith("물리") or "물리학" in s:
         base = "물리"
-    elif "화학" in s or s.startswith("화"):   # 과탐에서 '화'만 온 경우도 화학으로 간주
+    elif "화학" in s or s.startswith("화"):
         base = "화학"
     else:
-        # 예외: 그대로 반환 (숫자 붙어 있으면 유지)
         base = s
 
     return f"{base}{level}" if level else base
-
 
 def build_abs_url(raw: str | None, base: str) -> str | None:
     if not raw:
@@ -179,6 +165,30 @@ def main():
     ap.add_argument("--cookie-file", default=None)
     ap.add_argument("--cookie", default=None)
     ap.add_argument("--debug", action="store_true")
+
+    ap.add_argument(
+        "--category",
+        type=int,
+        choices=range(1, 9),
+        default=6,
+        help="과목 대분류 선택: 1=국어, 2=수학, 3=영어, 4=한국사, 5=사회탐구, 6=과학탐구, 7=직업탐구, 8=제2외국어 (기본: 6)"
+    )
+
+    ap.add_argument(
+        "--grade",    
+        type=int,
+        choices=range(1, 4),       # 1,2,3만 허용
+        default=3,
+        help="학년 선택: 1=고1, 2=고2, 3=고3 (기본: 3)"
+    )
+
+    # 기간/정렬 등은 기존 값 유지(필요하면 인자화해서 확장 가능)
+    ap.add_argument("--beginYear", default="2020")
+    ap.add_argument("--endYear", default="2024")
+    ap.add_argument("--sort", default="recent")
+    ap.add_argument("--pageSize", default="15")
+    ap.add_argument("--monthList", default="03,02,04,05,06,07,09,10,11,12")
+
     args = ap.parse_args()
 
     session = requests.Session()
@@ -201,9 +211,26 @@ def main():
 
     out_root = Path(args.out)
 
+    target_cd = TARGET_MAP[args.grade]
+    grade_name = GRADE_NAME[args.grade]
+
+    # ✅ payload를 동적으로 구성 (subjList를 인자로부터)
+    payload_base = {
+        "beginYear": args.beginYear,
+        "endYear": args.endYear,
+        "targetCd": target_cd,
+        "monthList": args.monthList,
+        "subjList": str(args.category),  # ← 여기!
+        "sort": args.sort,
+        "pageSize": args.pageSize,
+    }
+
+    # 카테고리명(폴더명에 사용)
+    category_name = CATEGORY_MAP.get(args.category, f"카테고리{args.category}")
+
     page = 1
     while True:
-        data = list(FIXED_PAYLOAD.items()) + [("currentPage", str(page))]
+        data = list(payload_base.items()) + [("currentPage", str(page))]
         r = session.post(args.list_url, data=data, timeout=60)
         r.raise_for_status()
         html = r.text
@@ -224,7 +251,7 @@ def main():
 
         for title, prob_path, sol_path in items:
             year  = extract_year(title)
-            month = extract_month(title)          # 새로 추가
+            month = extract_month(title)
             subj_raw = extract_subject_raw(title)
             subj_norm = normalize_subject(subj_raw)
 
@@ -234,10 +261,11 @@ def main():
             prob_ext = ext_from_url(prob_url, ".pdf")
             sol_ext  = ext_from_url(sol_url,  ".pdf")
 
-            # ---- 폴더명 규칙: downloads/기출문제_고3_과학탐구{과목}_{년도}
-            target_dir = out_root / f"기출문제_고3_과학탐구_{subj_norm}_{year}"
+            # ✅ 폴더명 규칙: downloads/기출문제_고3_{카테고리명}_{세부과목}_{년도}
+            # 예) 기출문제_고3_과학탐구_물리1_2021  /  기출문제_고3_영어_영어_2021
+            target_dir = out_root / f"기출문제_{grade_name}_{category_name}_{subj_norm}_{year}"
 
-            # ---- 파일명 규칙: YYYY_MM_과목_문제 / YYYY_MM_과목_해설
+            # 파일명 규칙: YYYY_MM_과목_문제 / YYYY_MM_과목_해설 (변경 없음)
             base_prefix = f"{year}_{month}_{subj_norm}"
             prob_name = f"{base_prefix}_문제{prob_ext}"
             sol_name  = f"{base_prefix}_해설{sol_ext}"
